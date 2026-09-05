@@ -111,6 +111,8 @@ class RemoteOperations:
         if self.bootkey is not None:
             return self.bootkey
 
+        # the SYSTEM hive is ~30MB going through WinRM at ~1MB/s
+        self.logger.display("Fetching the SYSTEM hive for the bootkey, grab a coffee and be patient...")
         system_hive_path = f"{self.shadow_copy_path}\\Windows\\System32\\config\\SYSTEM"
         if not self.get_file(system_hive_path, f"{output_filename}.system"):
             self.logger.fail("Could not get the SYSTEM hive")
