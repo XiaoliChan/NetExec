@@ -18,6 +18,7 @@ def proto_args(parser, parents):
     cgroup.add_argument("--sam", action="store_true", help="dump SAM hashes from target systems")
     cgroup.add_argument("--lsa", action="store_true", help="dump LSA secrets from target systems")
     cgroup.add_argument("--dpapi", action="store_true", help="dump user's Credential Manager secrets from target systems")
+    cgroup.add_argument("--list-snapshots", nargs="?", dest="list_snapshots", const="ADMIN$", help="Lists the VSS snapshots (default: %(const)s)")
 
     wmi_group = winrm_parser.add_argument_group("WMI Queries")
     wmi_group.add_argument("--wmi-query", metavar="QUERY", dest="wmi_query", type=str, help="Issues the specified WMI query via PowerShell CIM cmdlets")

@@ -1,4 +1,5 @@
 import os
+import re
 import base64
 import contextlib
 import traceback
@@ -334,6 +335,28 @@ class winrm(connection):
         return output
 
     @requires_admin
+    def list_snapshots(self):
+        drive = self.args.list_snapshots
+        self.logger.info(f"Retrieving volume shadow copies of drive {drive}.")
+        snapshots = self.wql_enumerate(
+            "SELECT ID, DeviceObject, ClientAccessible, InstallDate FROM Win32_ShadowCopy",
+            "root\\cimv2",
+        )
+        if not snapshots:
+            self.logger.info("No volume shadow copies found.")
+            return
+
+        self.logger.highlight(f"{'Drive':<8}{'Shadow Copy ID':<40}{'ClientAccessible':<18}{'InstallDate':<27}{'Device Object':<50}")
+        self.logger.highlight(f"{'------':<8}{'--------------':<40}{'----------------':<18}{'-----------':<27}{'-------------':<50}")
+        for record in snapshots:
+            self.logger.highlight(
+                f"{drive:<8}"
+                f"{record.get('ID') or '':<40}"
+                f"{str(record.get('ClientAccessible', '')).capitalize() if record.get('ClientAccessible') else '':<18}"
+                f"{record.get('InstallDate') or '':<27}"
+                f"{record.get('DeviceObject') or '':<50}"
+            )
+
     def wmi_query(self, wql=None, namespace=None):
         """Run a WQL query natively over WS-Management and print the results.
 
@@ -393,6 +416,24 @@ class winrm(connection):
                             if not isinstance(props[name], list):
                                 props[name] = [props[name]]
                             props[name].append(prop.text)
+                        elif prop.text is None and len(prop) == 1:
+                            # unwrap nested single-child values (e.g. InstallDate
+                            # arrives as <InstallDate><Datetime>...</Datetime>) and
+                            # normalize ISO datetimes to the DMTF format the DCOM
+                            # protocols return (2026-09-05T20:16:36.503745+08:00
+                            # -> 20260905201636.503745+480)
+                            text = prop[0].text
+                            match = re.match(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(?:([+-])(\d{2}):(\d{2}))?", text or "")
+                            if match:
+                                year, month, day, hour, minute, second, fraction, sign, tz_h, tz_m = match.groups()
+                                value = f"{year}{month}{day}{hour}{minute}{second}"
+                                if fraction:
+                                    value += f".{fraction[:6]}"
+                                if sign:
+                                    value += f"{sign}{int(tz_h) * 60 + int(tz_m)}"
+                                props[name] = value
+                            else:
+                                props[name] = text
                         else:
                             props[name] = prop.text
                     items.append(props)
