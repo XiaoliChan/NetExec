@@ -568,7 +568,7 @@ class winrm(connection):
     @property
     def remote_ops(self):
         if self._remote_ops is None:
-            self._remote_ops = RemoteOperations(self)
+            self._remote_ops = RemoteOperations(self, shadow_id=self.args.use_snapshot_id)
         return self._remote_ops
 
     @requires_admin
