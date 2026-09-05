@@ -605,6 +605,7 @@ class winrm(connection):
                 f"{output_filename}.sam",
                 bootkey,
                 isRemote=None,
+                history=self.args.history,
                 perSecretCallback=lambda secret: add_sam_hash(secret),
             )
             self.logger.display("Dumping SAM hashes")
