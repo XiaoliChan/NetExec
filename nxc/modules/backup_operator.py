@@ -182,10 +182,10 @@ class BackupOperator_WinRM(BackupOperator):
         log_path = f"{self.connection.output_filename}."
 
         # Dos attack prevent: reg save refuses to overwrite an existing file
-        # with an interactive "(Yes/No)?" prompt, and the WinRS shell is not
-        # a tty - pypsrp never gets an answer and loops the command until
-        # the target runs out of memory. Random store names prevent any
-        # preexisting file from matching. One reg save per hive: as a plain
+        # with an interactive "(Yes/No)?" prompt, and the runspace hosting
+        # the command is not a tty - pypsrp never gets an answer and loops
+        # the command until the target runs out of memory. Random store
+        # names prevent any preexisting file from matching. One reg save per hive: as a plain
         # backup operator reg save is refused on HKLM\SECURITY (SAM and
         # SYSTEM still go through), so one hive failing must not abort the
         # whole dump.

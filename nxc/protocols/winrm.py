@@ -603,7 +603,7 @@ class winrm(connection):
             if bootkey is None:
                 return
 
-            sam_hive_path = f"{self.remote_ops.shadow_copy_path}" + r"\Windows\System32\config\SAM"
+            sam_hive_path = self.remote_ops.shadow_path(r"C:\Windows\System32\config\SAM")
             if not self.remote_ops.get_file(sam_hive_path, f"{output_filename}.sam"):
                 self.logger.fail("Could not get SAM hive")
                 return
@@ -647,7 +647,7 @@ class winrm(connection):
             if bootkey is None:
                 return
 
-            security_hive_path = f"{self.remote_ops.shadow_copy_path}" + r"\Windows\System32\config\SECURITY"
+            security_hive_path = self.remote_ops.shadow_path(r"C:\Windows\System32\config\SECURITY")
             if not self.remote_ops.get_file(security_hive_path, f"{output_filename}.security"):
                 self.logger.fail("Could not get the SECURITY hive")
                 return

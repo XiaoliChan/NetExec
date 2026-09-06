@@ -19,7 +19,6 @@ class RemoteOperations:
         if shadow_id is not None:
             self.logger.display(f"Using existing VSS Snapshot ID: {shadow_id}")
         self._shadow_id = shadow_id
-        self._shadow_copy_path = None
         # Snapshot devices by volume, created on demand: the NTDS database
         # can live on a drive other than the system one
         self._shadow_devices = {}
@@ -101,12 +100,6 @@ class RemoteOperations:
             self._shadow_id = self.create_shadowcopy()
         return self._shadow_id
 
-    @property
-    def shadow_copy_path(self):
-        if self._shadow_copy_path is None:
-            self._shadow_copy_path = self.get_shadowcopy_path()
-        return self._shadow_copy_path
-
     def shadow_path(self, file_path):
         """Map a live file path to its location inside a snapshot of its volume."""
         volume = file_path[:3]
@@ -160,8 +153,8 @@ class RemoteOperations:
         if self.bootkey is not None:
             return self.bootkey
 
-        # the SYSTEM hive is ~30MB going through WinRM at ~1MB/s
-        self.logger.display("Fetching the SYSTEM hive for the bootkey, grab a coffee and be patient...")
+        # the SYSTEM hive is the biggest transfer of the dump
+        self.logger.display("Fetching the SYSTEM hive for the bootkey...")
         system_hive_path = self.shadow_path(r"C:\Windows\System32\config\SYSTEM")
         if system_hive_path is None or not self.get_file(system_hive_path, f"{output_filename}.system"):
             self.logger.fail("Could not get the SYSTEM hive")
