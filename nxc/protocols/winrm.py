@@ -29,6 +29,7 @@ from nxc.connection import connection, requires_admin
 from nxc.helpers.bloodhound import add_user_bh
 from nxc.helpers.logger import highlight
 from nxc.helpers.misc import validate_ntlm
+from nxc.protocols.winrm.file_transfer import FileTransfer
 from nxc.protocols.winrm.remoteops import RemoteOperations
 from nxc.protocols.ldap.gmsa import MSDS_MANAGEDPASSWORD_BLOB
 from nxc.helpers.negotiate_parser import parse_challenge
@@ -52,6 +53,7 @@ class winrm(connection):
         self.no_ntlm = False
         self.shell_types = []
         self._remote_ops = None
+        self._file_transfer = None
 
         connection.__init__(self, args, db, host)
 
@@ -362,6 +364,7 @@ class winrm(connection):
                 f"{record.get('DeviceObject') or '':<50}"
             )
 
+    @requires_admin
     def wmi_query(self, wql=None, namespace=None):
         """Run a WQL query natively over WS-Management and print the results.
 
@@ -538,12 +541,11 @@ class winrm(connection):
         # Do a bit of smart handling for the local file path
         if local_path.endswith("/"):
             local_path += ntpath.basename(remote_path)
-        try:
-            self.logger.display(f'Downloading "{remote_path}" to "{local_path}"')
-            self.conn.fetch(remote_path, local_path)
+        self.logger.display(f'Downloading "{remote_path}" to "{local_path}"')
+        if self.file_transfer.get_file(remote_path, local_path):
             self.logger.success(f"File {remote_path} has been saved to {local_path}")
-        except Exception as e:
-            self.logger.fail(f"Failed to get file {remote_path}, error: {e!s}")
+        else:
+            self.logger.fail(f"Failed to get file {remote_path}")
 
     def put_file(self, local_path=None, remote_path=None):
         local_path = local_path if local_path else self.args.put_file[0]
@@ -570,6 +572,12 @@ class winrm(connection):
         if self._remote_ops is None:
             self._remote_ops = RemoteOperations(self, shadow_id=self.args.use_snapshot_id)
         return self._remote_ops
+
+    @property
+    def file_transfer(self):
+        if self._file_transfer is None:
+            self._file_transfer = FileTransfer(self)
+        return self._file_transfer
 
     @requires_admin
     def sam(self):

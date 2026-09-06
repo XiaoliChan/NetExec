@@ -197,11 +197,10 @@ class BackupOperator_WinRM(BackupOperator):
 
         saved_hives = []
         for hive in self.HIVES:
-            try:
-                self.connection.conn.fetch(f"{TEMP_DIR}\\{hive}_{rand_suffix}", log_path + hive)
+            if self.connection.file_transfer.get_file(f"{TEMP_DIR}\\{hive}_{rand_suffix}", log_path + hive):
                 saved_hives.append(hive)
-            except Exception as e:
-                self.context.log.debug(f"Couldn't fetch the {hive} hive: {e!s}")
+            else:
+                self.context.log.debug(f"Couldn't fetch the {hive} hive")
         if "SAM" not in saved_hives or "SYSTEM" not in saved_hives:
             self.context.log.fail("Couldn't fetch the SAM or SYSTEM hive")
             self._print_cleanup_warning(rand_suffix)

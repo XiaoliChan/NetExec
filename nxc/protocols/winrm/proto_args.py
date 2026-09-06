@@ -25,9 +25,9 @@ def proto_args(parser, parents):
     kerb_keys_arg.make_required = [ntds_arg]
     enabled_arg.make_required = [ntds_arg]
     cgroup.add_argument("--user", dest="userntds", type=str, help="Dump selected user from DC (NTDS.dit)")
-    cgroup.add_argument("--use-snapshot-id", dest="use_snapshot_id", default=None, help="Reuse a VSS snapshot from --list-snapshots for hashdump instead of creating one")
     cgroup.add_argument("--dpapi", action="store_true", help="dump user's Credential Manager secrets from target systems")
     cgroup.add_argument("--list-snapshots", nargs="?", dest="list_snapshots", const="ADMIN$", help="Lists the VSS snapshots (default: %(const)s)")
+    cgroup.add_argument("--use-snapshot-id", dest="use_snapshot_id", default=None, help="Reuse a VSS snapshot from --list-snapshots for hashdump instead of creating one")
 
     wmi_group = winrm_parser.add_argument_group("WMI Queries")
     wmi_group.add_argument("--wmi-query", metavar="QUERY", dest="wmi_query", type=str, help="Issues the specified WMI query via PowerShell CIM cmdlets")
