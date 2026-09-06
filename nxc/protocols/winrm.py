@@ -320,7 +320,12 @@ class winrm(connection):
         class_uri = f"http://schemas.microsoft.com/wbem/wsman/1/wmi/{namespace_path}/{class_name}"
         body = ET.Element(f"{{{class_uri}}}{method}_INPUT")
         for name, value in (params or {}).items():
-            ET.SubElement(body, f"{{{class_uri}}}{name}").text = str(value)
+            if isinstance(value, list):
+                # array parameters arrive as repeated elements
+                for item in value:
+                    ET.SubElement(body, f"{{{class_uri}}}{name}").text = str(item)
+            else:
+                ET.SubElement(body, f"{{{class_uri}}}{name}").text = str(value)
 
         selector_set = None
         if selector:
